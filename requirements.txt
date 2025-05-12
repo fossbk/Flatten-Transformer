@@ -1,0 +1,41 @@
+# requirements.txt for FLatten-Transformer (dự kiến)
+
+# Core deep learning framework
+torch>=1.8.0     # Hoặc phiên bản PyTorch cụ thể được đề cập trong repo
+torchvision>=0.9.0 # Tương ứng với phiên bản PyTorch
+torchaudio>=0.8.0  # Tùy chọn, nếu có xử lý âm thanh liên quan
+
+# Thư viện cho các mô hình Vision Transformer và các tiện ích hình ảnh
+timm>=0.4.12     # PyTorch Image Models (thường được sử dụng cho các baseline như DeiT, Swin)
+
+# Tính toán FLOPs và parameters (thường thấy trong các repo Vision Transformer)
+fvcore>=0.1.5    # Từ Facebook Research, dùng để tính toán FLOPs
+thop             # Một thư viện khác để tính FLOPs/Params (tùy chọn thay thế hoặc bổ sung)
+
+# Xử lý dữ liệu và tính toán khoa học
+numpy>=1.19.0
+scipy>=1.5.0
+Pillow>=7.2.0    # Hoặc opencv-python cho xử lý ảnh
+scikit-learn     # Cho các tác vụ machine learning phụ trợ hoặc đánh giá
+pandas           # Nếu có xử lý dữ liệu dạng bảng
+
+# Tiện ích và các công cụ khác
+matplotlib       # Để vẽ đồ thị (tùy chọn)
+tensorboard      # Để theo dõi quá trình huấn luyện (tùy chọn)
+# tensorboardX   # Phiên bản cũ hơn của TensorBoard cho PyTorch (nếu repo cũ hơn)
+pyyaml           # Để đọc file cấu hình YAML
+tqdm             # Để hiển thị thanh tiến trình
+einops           # Thư viện giúp thao tác tensor dễ dàng hơn (khá phổ biến trong Transformer)
+termcolor        # Để in log có màu (tùy chọn, một số repo sử dụng)
+
+# Các thư viện có thể cần cho các tác vụ cụ thể (nếu repo hỗ trợ)
+# Ví dụ: Semantic Segmentation
+# detectron2     # Nếu dựa trên Detectron2
+# mmcv-full      # Nếu dựa trên các framework của OpenMMLab (MMDetection, MMSegmentation)
+# cityscapesscripts # Nếu làm việc với bộ dữ liệu Cityscapes
+
+# Ví dụ: Object Detection
+# pycocotools    # Cho việc đánh giá trên COCO
+
+# Các thư viện khác mà bạn có thể thấy trong các file import của dự án
+# Hãy kiểm tra các file .py trong repository để bổ sung nếu cần.
