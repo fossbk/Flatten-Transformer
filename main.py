@@ -1,5 +1,8 @@
-# main.py (Version 5)
+# main.py (Version 5.1)
 # Ghi chú fix lỗi và cải tiến:
+# - Sửa lỗi TypeError khi so sánh max_accuracy với acc1_val bằng cách đảm bảo
+#   kết quả từ hàm validate được unpack chính xác và biến chứa Acc@1 (float)
+#   được sử dụng đúng cách trong hàm max().
 # - Hoàn thiện parse_option: thêm --epochs, --auto-resume/--no-auto-resume, --amp/--no-amp.
 #   Đặt default=None cho các args để phân biệt với giá trị mặc định trong config.
 # - Distributed/Device Setup: Logic rõ ràng hơn, ưu tiên env vars từ launch utility.
@@ -9,9 +12,7 @@
 # - Resume Logic: Xử lý config.TRAIN.AUTO_RESUME và config.MODEL.RESUME.
 #   load_checkpoint được gọi với 5 tham số.
 #   config.TRAIN.START_EPOCH được cập nhật đúng sau khi resume từ checkpoint['epoch'].
-# - Training Loop:
-#   - Gọi validate và UNPACK KẾT QUẢ ĐÚNG CÁCH để sửa lỗi TypeError khi cập nhật max_accuracy.
-#   - Lưu checkpoint, step_epoch cho scheduler.
+# - Training Loop: Gọi validate có điều kiện, lưu checkpoint, step_epoch cho scheduler.
 # - Các hàm train_one_epoch, validate, throughput nhận config để truy cập LOCAL_RANK, AMP, etc.
 # - Import reduce_tensor từ utils.
 
@@ -30,13 +31,13 @@ from torch.cuda.amp import autocast, GradScaler
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.utils import accuracy, AverageMeter
 
-from config import get_config
+from config import get_config # Nên là Version 4 của config.py
 from models import build_model
-from data import build_loader # build_loader nhận is_distributed
+from data import build_loader # Nên là Version 4 của data/build.py
 from lr_scheduler import build_scheduler
 from optimizer import build_optimizer
 from logger import create_logger
-from utils import load_checkpoint, save_checkpoint_new, get_grad_norm, auto_resume_helper, reduce_tensor, load_pretrained
+from utils import load_checkpoint, save_checkpoint_new, get_grad_norm, auto_resume_helper, reduce_tensor, load_pretrained # Nên là Version 4 của utils.py
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -55,7 +56,7 @@ def parse_option():
     # Config overrides from command line
     parser.add_argument('--batch-size', type=int, default=None, help="Batch size per GPU (overrides config)")
     parser.add_argument('--data-path', type=str, default=None, help='Path to dataset (overrides config)')
-    parser.add_argument('--zip', action='store_true', default=None, help='Use zipped dataset (sets DATA.ZIP_MODE=True)') # Default None
+    parser.add_argument('--zip', action='store_true', default=None, help='Use zipped dataset (sets DATA.ZIP_MODE=True if present)')
     parser.add_argument('--cache-mode', type=str, default=None, choices=['no', 'full', 'part'],
                         help='Dataset cache mode (overrides config)')
     parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint (overrides config, use "" for no resume)')
@@ -88,7 +89,6 @@ def parse_option():
     return args, config
 
 def adjusted_reduce_tensor(tensor, world_size):
-    # Sử dụng hàm reduce_tensor đã import từ utils.py
     if world_size > 1 and dist.is_available() and dist.is_initialized():
         return reduce_tensor(tensor) 
     return tensor
@@ -97,82 +97,87 @@ def main():
     args, config = parse_option()
 
     is_distributed = False
-    if 'WORLD_SIZE' in os.environ and int(os.environ['WORLD_SIZE']) > 1:
-        is_distributed = True
-        if args.local_rank == -1 and "LOCAL_RANK" in os.environ: 
-            args.local_rank = int(os.environ['LOCAL_RANK'])
-    
-    elif args.local_rank != -1 and torch.cuda.is_available() and torch.cuda.device_count() > 1:
-        print("Warning: local_rank is set, attempting DDP. Ensure env vars for DDP are set if not using a launch utility.")
-        if 'WORLD_SIZE' in os.environ and int(os.environ['WORLD_SIZE']) > 1:
-            is_distributed = True
-        else: # Fallback nếu WORLD_SIZE không được set đúng
-            print("Warning: local_rank is set but WORLD_SIZE env var suggests single process. Running non-distributed.")
-            is_distributed = False
-            args.local_rank = 0 if torch.cuda.is_available() else -1
-
-
-    current_gpu_or_device_str = 'cpu' 
-    rank = 0
+    rank = 0 
     world_size = 1
     
+    if 'WORLD_SIZE' in os.environ:
+        world_size_env = int(os.environ['WORLD_SIZE'])
+        if world_size_env > 1:
+            is_distributed = True
+            if args.local_rank == -1 and "LOCAL_RANK" in os.environ: 
+                args.local_rank = int(os.environ['LOCAL_RANK'])
+    elif args.local_rank != -1 and torch.cuda.is_available() and torch.cuda.device_count() > 1 : # User manually set local_rank for DDP
+        print("Warning: local_rank is set, attempting DDP. Ensure MASTER_ADDR, MASTER_PORT, RANK, WORLD_SIZE env vars are set if not using a launch utility or if init_method is 'env://'.")
+        # Trong trường hợp này, WORLD_SIZE và RANK nên được lấy từ env var hoặc opts
+        # Để đơn giản, nếu dùng --local_rank khác -1 và có nhiều GPU, ta giả định người dùng muốn DDP
+        # và các env var khác sẽ được cung cấp hoặc init_method không phải 'env://'
+        # Hoặc code có thể cần phức tạp hơn để tự tính WORLD_SIZE và RANK nếu không có env var
+        # Tạm thời, nếu WORLD_SIZE env var không có, ta sẽ không kích hoạt DDP để tránh lỗi init.
+        if 'WORLD_SIZE' in os.environ and int(os.environ['WORLD_SIZE']) > 1:
+            is_distributed = True
+        else:
+            print("Warning: local_rank is set but WORLD_SIZE env var suggests single process or is not set. Running non-distributed.")
+            is_distributed = False # Fallback to non-distributed
+            args.local_rank = 0 if torch.cuda.is_available() else -1 # Chạy trên GPU đầu tiên nếu có
+
+
+    current_gpu_or_device_str = 'cpu'
+    
     if is_distributed:
-        if args.local_rank == -1: 
-             args.local_rank = 0 
-             print("Warning: DDP mode but local_rank is invalid (-1). Defaulting to 0. This may lead to errors.")
+        if args.local_rank == -1 : # Should have been set by launch utility or logic above
+             args.local_rank = 0 # Default, but problematic for DDP if not rank 0
+             print("CRITICAL Warning: DDP mode but local_rank is -1. Defaulting to 0. This WILL LIKELY BE INCORRECT if not actually process 0.")
         
         torch.cuda.set_device(args.local_rank)
         try:
-            # init_method='env://' sẽ tự động đọc RANK, WORLD_SIZE, MASTER_ADDR, MASTER_PORT từ biến môi trường
             dist.init_process_group(backend='nccl', init_method='env://')
             rank = dist.get_rank()
-            world_size = dist.get_world_size()
-            torch.distributed.barrier() # Đảm bảo tất cả các process đã init xong
+            world_size = dist.get_world_size() # Lấy world_size thực tế từ DDP
+            torch.distributed.barrier()
             print(f"DDP Initialized: GlobalRank={rank}, LocalRank={args.local_rank}, WorldSize={world_size} on GPU cuda:{args.local_rank}")
             current_gpu_or_device_str = f"cuda:{args.local_rank}"
         except Exception as e:
-            print(f"Failed to initialize distributed group: {e}. Attempting to run non-distributed.")
-            is_distributed = False # Fallback
+            print(f"Failed to initialize distributed group: {e}. Running non-distributed.")
+            is_distributed = False
             rank = 0
             world_size = 1
-            # Fallback local_rank cho config
-            args.local_rank = 0 if torch.cuda.is_available() else -1 
+            args.local_rank = 0 if torch.cuda.is_available() else -1
             if args.local_rank != -1:
                 torch.cuda.set_device(args.local_rank)
-                print(f"Running non-distributed on single GPU: cuda:{args.local_rank}")
                 current_gpu_or_device_str = f"cuda:{args.local_rank}"
+                print(f"Running non-distributed on single GPU: {current_gpu_or_device_str}")
             else:
-                print("Running non-distributed on CPU")
                 current_gpu_or_device_str = 'cpu'
-    else: # Non-distributed
+                print("Running non-distributed on CPU")
+    else: 
         rank = 0
         world_size = 1
         if torch.cuda.is_available():
-            args.local_rank = 0 # Chạy trên GPU đầu tiên
+            args.local_rank = 0 
             torch.cuda.set_device(args.local_rank)
-            print(f"Running on single GPU: cuda:{args.local_rank}")
             current_gpu_or_device_str = f"cuda:{args.local_rank}"
+            print(f"Running on single GPU: {current_gpu_or_device_str}")
         else:
-            args.local_rank = -1 # Cho CPU
-            print("Running on CPU")
+            args.local_rank = -1 
             current_gpu_or_device_str = 'cpu'
+            print("Running on CPU")
 
     config.defrost()
-    config.LOCAL_RANK = args.local_rank # local_rank thực sự đang dùng (device_id hoặc -1 cho CPU)
-    config.RANK = rank                  # global rank
-    config.WORLD_SIZE = world_size      # tổng số process
+    config.LOCAL_RANK = args.local_rank 
+    config.RANK = rank                  
+    config.WORLD_SIZE = world_size      
     config.freeze()
 
     if is_distributed and torch.cuda.is_available() and dist.get_backend() == 'nccl':
         os.environ["NCCL_BLOCKING_WAIT"] = "1"
 
-    seed = config.SEED + rank 
+    seed = config.SEED + rank
     torch.manual_seed(seed)
     np.random.seed(seed)
     cudnn.enabled = True
     cudnn.benchmark = True 
 
-    if config.WORLD_SIZE > 0: # Nên luôn > 0
+    if config.WORLD_SIZE > 0:
         eff_batch_size = config.DATA.BATCH_SIZE * config.WORLD_SIZE
         base_lr = config.TRAIN.BASE_LR
         warmup_lr = config.TRAIN.WARMUP_LR
@@ -192,7 +197,7 @@ def main():
     logger = create_logger(output_dir=config.OUTPUT, dist_rank=rank, name=f"{config.MODEL.NAME}")
 
     if rank == 0:
-        path = os.path.join(config.OUTPUT, "config_final.json") # Đổi tên để tránh ghi đè config.json nếu có
+        path = os.path.join(config.OUTPUT, "config_final_effective.json") 
         with open(path, "w") as f: f.write(config.dump())
         logger.info(f"Full effective config saved to {path}")
 
@@ -201,10 +206,9 @@ def main():
     logger.info(f"Running on device: {current_gpu_or_device_str}")
     logger.info(f"Batch size per process/GPU: {config.DATA.BATCH_SIZE}")
     logger.info(f"Total effective batch size: {config.DATA.BATCH_SIZE * config.WORLD_SIZE}")
-    logger.info(f"Target total training epochs: {config.TRAIN.EPOCHS}")
-    logger.info(f"Base LR (after scaling for total batch size {config.DATA.BATCH_SIZE * config.WORLD_SIZE}): {config.TRAIN.BASE_LR:.2e}")
-    logger.info(f"Warmup LR (after scaling): {config.TRAIN.WARMUP_LR:.2e}, Min LR (after scaling): {config.TRAIN.MIN_LR:.2e}")
-    logger.info(f"Warmup epochs: {config.TRAIN.WARMUP_EPOCHS}")
+    logger.info(f"Target total training epochs: {config.TRAIN.EPOCHS}") # Tổng số epoch muốn đạt đến
+    logger.info(f"Base LR (scaled): {config.TRAIN.BASE_LR:.2e}, Warmup LR (scaled): {config.TRAIN.WARMUP_LR:.2e}, Min LR (scaled): {config.TRAIN.MIN_LR:.2e}")
+    logger.info(f"Warmup epochs in config: {config.TRAIN.WARMUP_EPOCHS}")
     logger.info(f"AMP enabled: {config.AMP}")
 
     dataset_train, dataset_val, data_loader_train, data_loader_val, mixup_fn = build_loader(config, is_distributed)
@@ -228,9 +232,8 @@ def main():
     lr_scheduler = build_scheduler(config, optimizer, len(data_loader_train))
     
     # config.TRAIN.EPOCHS là tổng số epoch muốn huấn luyện đến
-    # config.TRAIN.START_EPOCH là epoch bắt đầu (0 nếu từ đầu, hoặc giá trị từ checkpoint)
-    total_epochs_target = config.TRAIN.EPOCHS # Tổng số epoch mục tiêu
-    # cooldown_epochs sẽ được cộng vào total_epochs_target nếu có
+    # config.TRAIN.START_EPOCH là epoch bắt đầu (0 nếu từ đầu, hoặc giá trị từ checkpoint là epoch đã hoàn thành)
+    total_epochs_target = config.TRAIN.EPOCHS
     effective_total_epochs_for_loop = total_epochs_target + config.TRAIN.COOLDOWN_EPOCHS
 
 
@@ -255,27 +258,24 @@ def main():
     
     if actual_resume_path and actual_resume_path != '':
         logger.info(f"Attempting to load full checkpoint from: {actual_resume_path}")
-        if config.MODEL.RESUME != actual_resume_path: # Cập nhật config nếu auto_resume tìm thấy file khác
-             config.defrost()
-             config.MODEL.RESUME = actual_resume_path
-             config.freeze()
+        if config.MODEL.RESUME != actual_resume_path:
+             config.defrost(); config.MODEL.RESUME = actual_resume_path; config.freeze()
         
-        # load_checkpoint cập nhật config.TRAIN.START_EPOCH bên trong nó
+        # load_checkpoint cập nhật config.TRAIN.START_EPOCH bên trong nó (thành completed_epoch)
+        # và trả về max_accuracy từ checkpoint
         max_accuracy_from_ckpt = load_checkpoint(config, model_without_ddp, optimizer, lr_scheduler, logger)
         max_accuracy = max(max_accuracy, max_accuracy_from_ckpt) 
         
         if not config.EVAL_MODE: 
             logger.info("Validating resumed model...")
-            acc1_resumed, acc5_resumed, loss_resumed = validate(config, data_loader_val, model, logger, config.WORLD_SIZE)
-            max_accuracy = max(max_accuracy, acc1_resumed) # Đảm bảo acc1_resumed là float
-            logger.info(f"Resumed model validation: Acc@1 {acc1_resumed:.2f}%, Acc@5 {acc5_resumed:.2f}%, Loss {loss_resumed:.4f}")
+            # --- ĐẢM BẢO UNPACK ĐÚNG KẾT QUẢ TỪ VALIDATE ---
+            acc1_resumed_float, acc5_resumed_float, loss_resumed_float = validate(config, data_loader_val, model, logger, config.WORLD_SIZE)
+            max_accuracy = max(max_accuracy, acc1_resumed_float) # Sử dụng giá trị float đã unpack
+            logger.info(f"Resumed model validation: Acc@1 {acc1_resumed_float:.2f}%, Acc@5 {acc5_resumed_float:.2f}%, Loss {loss_resumed_float:.4f}")
         if config.LOCAL_RANK != -1: torch.cuda.empty_cache()
     else:
         logger.info("No checkpoint to resume from. Training from scratch or using --pretrained weights (if provided).")
-        # Đảm bảo START_EPOCH là 0 nếu không resume
-        config.defrost()
-        config.TRAIN.START_EPOCH = 0
-        config.freeze()
+        config.defrost(); config.TRAIN.START_EPOCH = 0; config.freeze() # Đảm bảo START_EPOCH là 0 nếu không resume
 
 
     if config.EVAL_MODE:
@@ -285,7 +285,6 @@ def main():
         logger.info(f"--- Starting Evaluation on Validation Set (from checkpoint: {config.MODEL.RESUME}) ---")
         acc1_eval, acc5_eval, loss_eval = validate(config, data_loader_val, model, logger, config.WORLD_SIZE) # Unpack đúng
         logger.info(f"Evaluation Results: Acc@1 {acc1_eval:.3f} Acc@5 {acc5_eval:.3f} Loss {loss_eval:.4f}")
-        # logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1_eval:.1f}%") # Có thể bị lặp
         return
 
     if config.THROUGHPUT_MODE:
@@ -293,68 +292,61 @@ def main():
         throughput(data_loader_val, model, logger, config)
         return
 
-    # config.TRAIN.START_EPOCH là epoch đã hoàn thành + 1 (hoặc 0 nếu từ đầu)
-    # Vòng lặp for epoch in range(start, end) sẽ chạy từ start đến end-1.
-    # Epoch hiển thị cho người dùng thường là epoch_index_trong_loop + 1.
-    # Nếu START_EPOCH là epoch tiếp theo cần chạy (ví dụ, resume từ ckpt epoch 1 -> START_EPOCH=1)
-    # thì vòng lặp for epoch in range(config.TRAIN.START_EPOCH, effective_total_epochs_for_loop)
-    # sẽ chạy từ epoch=1 (là epoch thứ 2) đến effective_total_epochs_for_loop - 1.
-    # Logger sẽ in ra epoch + 1.
-    start_epoch_loop = config.TRAIN.START_EPOCH 
-    if actual_resume_path and actual_resume_path != '': # Nếu resume, START_EPOCH đã được load_checkpoint đặt là completed_epoch
-        logger.info(f"Resumed: START_EPOCH in config is {config.TRAIN.START_EPOCH} (completed epochs). Loop will start from this value.")
-        start_epoch_loop = config.TRAIN.START_EPOCH # vòng lặp for sẽ bắt đầu từ epoch này (ví dụ epoch 1)
-                                                    # và logger sẽ in epoch+1 (tức là epoch 2)
-
-    logger.info(f"--- Starting Training from actual loop index {start_epoch_loop} (display epoch {start_epoch_loop + 1}) ---")
-    logger.info(f"--- Target total epochs: {total_epochs_target} (loop runs up to {effective_total_epochs_for_loop-1}) ---")
-
+    # config.TRAIN.START_EPOCH là epoch đã hoàn thành (ví dụ, 0 nếu từ đầu, 1 nếu resume từ ckpt_epoch_1)
+    # Vòng lặp for epoch in range(start_epoch, total_epochs_target) sẽ chạy từ start_epoch đến total_epochs_target - 1
+    # Logger sẽ in ra epoch + 1 làm số epoch hiển thị
+    start_epoch_for_loop = config.TRAIN.START_EPOCH # epoch đã hoàn thành
+    
+    logger.info(f"--- Starting Training from completed epoch {start_epoch_for_loop} (next epoch to run: {start_epoch_for_loop + 1}) ---")
+    logger.info(f"--- Target total epochs: {total_epochs_target} (loop will run up to epoch index {effective_total_epochs_for_loop -1}) ---")
 
     start_time = time.time()
-    for epoch in range(start_epoch_loop, effective_total_epochs_for_loop): 
-        if is_distributed and hasattr(data_loader_train.sampler, 'set_epoch'):
-            data_loader_train.sampler.set_epoch(epoch) # Truyền epoch hiện tại của vòng lặp
+    # Vòng lặp chạy từ epoch đã hoàn thành (ví dụ 0) đến tổng số epoch mục tiêu (ví dụ 30)
+    # epoch_idx sẽ là 0, 1, ..., 29 nếu START_EPOCH=0 và total_epochs_target=30
+    for epoch_idx in range(start_epoch_for_loop, effective_total_epochs_for_loop):
+        # epoch_display là epoch_idx + 1, là số epoch hiển thị cho người dùng (1-based)
+        current_display_epoch = epoch_idx + 1
 
-        train_one_epoch(config, model, criterion, data_loader_train, optimizer, epoch, mixup_fn, lr_scheduler, logger, effective_total_epochs_for_loop)
+        if is_distributed and hasattr(data_loader_train.sampler, 'set_epoch'):
+            data_loader_train.sampler.set_epoch(epoch_idx) # Truyền epoch_idx (0-based)
+
+        train_one_epoch(config, model, criterion, data_loader_train, optimizer, epoch_idx, mixup_fn, lr_scheduler, logger, effective_total_epochs_for_loop)
         
         if config.LOCAL_RANK != -1: torch.cuda.empty_cache()
 
-        acc1_val_epoch, acc5_val_epoch, loss_val_epoch = -1.0, -1.0, -1.0 
-        if (epoch + 1) % config.SAVE_FREQ == 0 or (epoch + 1) == effective_total_epochs_for_loop:
-            acc1_val_epoch, acc5_val_epoch, loss_val_epoch = validate(config, data_loader_val, model, logger, config.WORLD_SIZE)
-            logger.info(f"Validation after epoch {epoch+1}: Acc@1 {acc1_val_epoch:.2f}%, Acc@5 {acc5_val_epoch:.2f}%, Loss {loss_val_epoch:.4f}")
+        current_epoch_acc1 = -1.0 
+        if (current_display_epoch % config.SAVE_FREQ == 0) or (current_display_epoch == effective_total_epochs_for_loop):
+            # ---- ĐẢM BẢO UNPACK ĐÚNG KẾT QUẢ TỪ VALIDATE ----
+            acc1_val_epoch_float, acc5_val_epoch_float, loss_val_epoch_float = validate(config, data_loader_val, model, logger, config.WORLD_SIZE)
+            current_epoch_acc1 = acc1_val_epoch_float # Gán giá trị float
+            logger.info(f"Validation after epoch {current_display_epoch}: Acc@1 {current_epoch_acc1:.2f}%, Acc@5 {acc5_val_epoch_float:.2f}%, Loss {loss_val_epoch_float:.4f}")
 
-            is_best = acc1_val_epoch > max_accuracy
-            max_accuracy = max(max_accuracy, acc1_val_epoch) 
+            is_best = current_epoch_acc1 > max_accuracy # So sánh float với float
+            max_accuracy = max(max_accuracy, current_epoch_acc1) # max(float, float)
             logger.info(f'Max accuracy so far: {max_accuracy:.2f}%')
 
             if rank == 0: 
-                save_checkpoint_new(config, epoch + 1, model_without_ddp, acc1_val_epoch, optimizer, lr_scheduler, logger, name=f'ckpt_epoch_{epoch+1}')
+                save_checkpoint_new(config, current_display_epoch, model_without_ddp, current_epoch_acc1, optimizer, lr_scheduler, logger, name=f'ckpt_epoch_{current_display_epoch}')
                 if is_best:
-                    save_checkpoint_new(config, epoch + 1, model_without_ddp, acc1_val_epoch, optimizer, lr_scheduler, logger, name='max_acc')
+                    save_checkpoint_new(config, current_display_epoch, model_without_ddp, current_epoch_acc1, optimizer, lr_scheduler, logger, name='max_acc')
         
-        # Step LR scheduler
         if lr_scheduler is not None:
-            # Đối với ReduceLROnPlateau, step với metric sau validate
             if isinstance(lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                if acc1_val_epoch != -1.0: # Chỉ step nếu đã validate ở epoch này
-                    lr_scheduler.step(acc1_val_epoch)
-            # Đối với các scheduler khác của PyTorch (không phải của timm) step theo epoch
-            elif isinstance(lr_scheduler, torch.optim.lr_scheduler._LRScheduler) and not hasattr(lr_scheduler, 'step_update'):
-                 lr_scheduler.step() # Gọi sau mỗi epoch
-            # Scheduler của timm có thể có step_epoch (ít phổ biến) hoặc step_update (theo batch, đã gọi trong train_one_epoch)
-            elif hasattr(lr_scheduler, 'step_epoch') and not hasattr(lr_scheduler, 'step_update'):
-                 lr_scheduler.step_epoch(epoch + 1)
-
+                if current_epoch_acc1 != -1.0 : 
+                    lr_scheduler.step(current_epoch_acc1)
+            elif not hasattr(lr_scheduler, 'step_update'): # Schedulers của PyTorch gốc
+                 lr_scheduler.step() # Gọi sau mỗi epoch_idx
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     logger.info(f'Total training time for this run: {total_time_str}')
 
+# --- Các hàm train_one_epoch, validate, throughput (phiên bản Version 4) ---
+# (Dán lại toàn bộ 3 hàm này từ phiên bản utils.py Version 4 / main.py Version 4 vào đây)
+# Đảm bảo chúng sử dụng `config` để lấy LOCAL_RANK, WORLD_SIZE, AMP
+# và hàm validate trả về 3 giá trị float.
 
-# --- Các hàm train_one_epoch, validate, throughput (phiên bản Version 4 đã cung cấp trước đó) ---
-# (Đảm bảo chúng sử dụng `config` để lấy LOCAL_RANK, WORLD_SIZE, AMP)
-def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler, logger, total_epochs_for_loop):
+def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch_idx, mixup_fn, lr_scheduler, logger, total_epochs_for_loop):
     model.train()
     num_steps = len(data_loader)
     batch_time = AverageMeter()
@@ -366,13 +358,12 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
     use_amp_scaler = config.AMP and torch.cuda.is_available() and config.LOCAL_RANK != -1
     scaler = GradScaler() if use_amp_scaler else None
 
-    for idx, (samples, targets) in enumerate(data_loader):
+    for batch_idx, (samples, targets) in enumerate(data_loader):
         optimizer.zero_grad()
         
         device_to_use = torch.device(config.LOCAL_RANK if config.LOCAL_RANK !=-1 else 'cpu')
         samples = samples.to(device_to_use, non_blocking=True if str(device_to_use) != 'cpu' else False)
         targets = targets.to(device_to_use, non_blocking=True if str(device_to_use) != 'cpu' else False)
-
 
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
@@ -390,21 +381,22 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
             scaler.step(optimizer)
             scaler.update()
             if grad_norm_val is None and not (config.TRAIN.CLIP_GRAD and config.TRAIN.CLIP_GRAD > 0):
-                # grad_norm_val = get_grad_norm(model.parameters()) # Có thể lấy ở đây nếu cần
-                pass
+                # grad_norm_val = get_grad_norm(model.parameters())
+                pass # Hoặc tính grad_norm sau scaler.update() nếu cần
         else:
             outputs = model(samples)
             loss = criterion(outputs, targets)
             loss.backward()
+            model_params_for_grad_norm = model.module.parameters() if isinstance(model, nn.parallel.DistributedDataParallel) else model.parameters()
             if config.TRAIN.CLIP_GRAD and config.TRAIN.CLIP_GRAD > 0:
-                grad_norm_tensor = nn.utils.clip_grad_norm_(model.parameters(), config.TRAIN.CLIP_GRAD)
+                grad_norm_tensor = nn.utils.clip_grad_norm_(model_params_for_grad_norm, config.TRAIN.CLIP_GRAD)
                 grad_norm_val = grad_norm_tensor.item() if torch.is_tensor(grad_norm_tensor) else grad_norm_tensor
             else:
-                grad_norm_val = get_grad_norm(model.parameters()) # Cần cẩn thận với DDP, nên dùng model_without_ddp
+                grad_norm_val = get_grad_norm(model_params_for_grad_norm)
             optimizer.step()
         
-        if lr_scheduler is not None and hasattr(lr_scheduler, 'step_update'): # Chỉ cho timm schedulers step theo batch
-            lr_scheduler.step_update(epoch * num_steps + idx)
+        if lr_scheduler is not None and hasattr(lr_scheduler, 'step_update'): # timm schedulers
+            lr_scheduler.step_update(epoch_idx * num_steps + batch_idx)
 
 
         if config.LOCAL_RANK != -1: torch.cuda.synchronize()
@@ -414,26 +406,26 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
         batch_time.update(time.time() - end_time_batch)
         end_time_batch = time.time()
 
-        if (idx + 1) % config.PRINT_FREQ == 0 or idx == num_steps - 1:
+        if (batch_idx + 1) % config.PRINT_FREQ == 0 or batch_idx == num_steps - 1:
             lr = optimizer.param_groups[0]['lr']
             memory_used = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0) if torch.cuda.is_available() and config.LOCAL_RANK != -1 else 0
-            etas = batch_time.avg * (num_steps - idx - 1)
-            current_norm_display = norm_meter.val if norm_meter.count > 0 else 0.0
+            etas = batch_time.avg * (num_steps - batch_idx - 1)
+            current_norm_display = norm_meter.val if norm_meter.count > 0 else (grad_norm_val if grad_norm_val is not None else 0.0)
             avg_norm_display = norm_meter.avg if norm_meter.count > 0 else 0.0
             logger.info(
-                f'Train: [{epoch + 1}/{total_epochs_for_loop}][{idx + 1}/{num_steps}]\t' # Hiển thị epoch thực tế
+                f'Train: [{epoch_idx + 1}/{total_epochs_for_loop}][{batch_idx + 1}/{num_steps}]\t'
                 f'eta {datetime.timedelta(seconds=int(etas))} lr {lr:.6f}\t'
                 f'time {batch_time.val:.4f} ({batch_time.avg:.4f})\t'
                 f'loss {loss_meter.val:.4f} ({loss_meter.avg:.4f})\t'
                 f'grad_norm {current_norm_display:.4f} ({avg_norm_display:.4f})\t'
                 f'mem {memory_used:.0f}MB')
     epoch_time_val = time.time() - start_time_batch_loop
-    logger.info(f"EPOCH {epoch + 1} training takes {datetime.timedelta(seconds=int(epoch_time_val))}")
+    logger.info(f"EPOCH {epoch_idx + 1} training takes {datetime.timedelta(seconds=int(epoch_time_val))}")
 
 @torch.no_grad()
 def validate(config, data_loader, model, logger, world_size):
     criterion = nn.CrossEntropyLoss()
-    model.eval()
+    model.eval() # Quan trọng: đặt model ở chế độ eval
     batch_time = AverageMeter()
     loss_meter = AverageMeter()
     acc1_meter = AverageMeter()
@@ -449,7 +441,7 @@ def validate(config, data_loader, model, logger, world_size):
         loss = criterion(output, target)
         acc1_val_batch, acc5_val_batch = accuracy(output, target, topk=(1, 5))
 
-        loss_reduced = adjusted_reduce_tensor(loss, world_size) # Sử dụng hàm đã được sửa trong main.py
+        loss_reduced = adjusted_reduce_tensor(loss.clone(), world_size) # Clone trước khi reduce
         acc1_reduced = adjusted_reduce_tensor(acc1_val_batch.clone(), world_size)
         acc5_reduced = adjusted_reduce_tensor(acc5_val_batch.clone(), world_size)
 
@@ -470,13 +462,12 @@ def validate(config, data_loader, model, logger, world_size):
                 f'Acc@5 {acc5_meter.val:.3f} ({acc5_meter.avg:.3f})\t'
                 f'Mem {memory_used:.0f}MB')
     logger.info(f' * Acc@1 {acc1_meter.avg:.3f} Acc@5 {acc5_meter.avg:.3f}')
-    return acc1_meter.avg, acc5_meter.avg, loss_meter.avg # Trả về 3 giá trị float
+    return acc1_meter.avg, acc5_meter.avg, loss_meter.avg
 
 @torch.no_grad()
 def throughput(data_loader, model, logger, config): 
     model.eval()
     use_cuda_throughput = torch.cuda.is_available() and config.LOCAL_RANK != -1
-    # Sửa: device_to_use_throughput nên là torch.device object
     device_to_use_throughput = torch.device(config.LOCAL_RANK if use_cuda_throughput else 'cpu')
 
     try:
@@ -502,7 +493,7 @@ def throughput(data_loader, model, logger, config):
     tic2 = time.time()
     
     elapsed_time = tic2 - tic1
-    if elapsed_time == 0: elapsed_time = 1e-6
+    if elapsed_time == 0: elapsed_time = 1e-6 # Tránh chia cho 0
     throughput_val = measure_iterations * batch_size / elapsed_time
     logger.info(f"Batch_size {batch_size} -> Throughput: {throughput_val:.2f} images/sec")
     return
