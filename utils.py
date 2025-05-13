@@ -1,235 +1,265 @@
-{\rtf1\ansi\ansicpg1252\cocoartf2821
-\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
-{\colortbl;\red255\green255\blue255;}
-{\*\expandedcolortbl;;}
-\paperw11900\paperh16840\margl1440\margr1440\vieww11520\viewh8400\viewkind0
-\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+# utils.py (Version 4)
+# Ghi chú fix lỗi:
+# - Thêm lại hàm `reduce_tensor` đã bị thiếu.
+# - load_checkpoint:
+#   - Thêm weights_only=False vào torch.load().
+#   - Đảm bảo nhận logger làm tham số và sử dụng nó.
+#   - Xử lý state_dict DDP/non-DDP một cách linh hoạt.
+#   - Cập nhật config.TRAIN.START_EPOCH = checkpoint['epoch'] + 1.
+#   - Load optimizer, scheduler, max_accuracy nếu có và không ở EVAL_MODE.
+#   - Thêm cảnh báo nếu NUM_CLASSES không khớp.
+# - save_checkpoint_new:
+#   - Lưu model.state_dict() từ model_without_ddp.
+#   - Lưu epoch, optimizer, lr_scheduler, max_accuracy.
+#   - KHÔNG lưu toàn bộ đối tượng config (CfgNode).
 
-\f0\fs24 \cf0 # File: /content/drive/MyDrive/00 AI/MultiView_SLR/FLatten-Transformer/utils.py\
-import os\
-import torch\
-import torch.distributed as dist\
-# import pickle # Kh\'f4ng c\uc0\u7847 n thi\u7871 t\
-# from yacs.config import CfgNode as CN # Kh\'f4ng c\uc0\u7847 n thi\u7871 t n\u7871 u kh\'f4ng l\u432 u/load CfgNode tr\u7921 c ti\u7871 p\
-\
-# --- C\'c1C H\'c0M KH\'c1C (get_grad_norm, auto_resume_helper, reduce_tensor, load_pretrained) ---\
-# --- GI\uc0\u7918  NGUY\'caN NH\u431  TRONG REPOSITORY G\u7888 C HO\u7862 C \u272 \u7842 M B\u7842 O CH\'daNG T\u431 \u416 NG TH\'cdCH ---\
-\
-# V\'ed d\uc0\u7909 :\
-def get_grad_norm(parameters, norm_type=2):\
-    if isinstance(parameters, torch.Tensor):\
-        parameters = [parameters]\
-    parameters = list(filter(lambda p: p.grad is not None, parameters))\
-    norm_type = float(norm_type)\
-    if len(parameters) == 0:\
-        return torch.tensor(0.)\
-    device = parameters[0].grad.device\
-    total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), norm_type).to(device) for p in parameters]), norm_type)\
-    return total_norm\
-\
-def reduce_tensor(tensor): # H\'e0m n\'e0y c\'f3 th\uc0\u7875  \u273 \u432 \u7907 c thay th\u7871  b\u7857 ng adjusted_reduce_tensor trong main.py\
-    rt = tensor.clone()\
-    dist.all_reduce(rt, op=dist.ReduceOp.SUM)\
-    rt /= dist.get_world_size()\
-    return rt\
-\
-def auto_resume_helper(output_dir):\
-    checkpoints = os.listdir(output_dir)\
-    checkpoints = [ckpt for ckpt in checkpoints if ckpt.endswith('pth')]\
-    print(f"All checkpoints founded in \{output_dir\}: \{checkpoints\}") # S\uc0\u7917 a l\u7895 i \u273 \'e1nh m\'e1y\
-    if not checkpoints:\
-        return None\
-    checkpoints = [ckpt for ckpt in checkpoints if ckpt.startswith('ckpt_epoch_')] # Ch\uc0\u7881  x\'e9t c\'e1c ckpt epoch\
-    if not checkpoints:\
-         # N\uc0\u7871 u kh\'f4ng c\'f3 ckpt_epoch_, th\u7917  t\'ecm max_acc.pth\
-        if 'max_acc.pth' in os.listdir(output_dir):\
-            print(f"Found max_acc.pth in \{output_dir\}")\
-            return os.path.join(output_dir, 'max_acc.pth')\
-        return None\
-\
-    checkpoints.sort(key=lambda x: int(x.split('_')[-1].split('.')[0])) # S\uc0\u7855 p x\u7871 p theo s\u7889  epoch\
-    latest_checkpoint = os.path.join(output_dir, checkpoints[-1])\
-    print(f"Auto-resume picking latest checkpoint: \{latest_checkpoint\}")\
-    return latest_checkpoint\
-\
-# load_pretrained c\'f3 th\uc0\u7875  c\u7847 n config n\u7871 u n\'f3 thay \u273 \u7893 i head c\u7911 a model d\u7921 a tr\'ean num_classes\
-def load_pretrained(pretrained_path, model, logger, config=None):\
-    logger.info(f"==============> Loading pretrained weights from \{pretrained_path\}")\
-    if not os.path.isfile(pretrained_path):\
-        logger.error(f"=> No pretrained weights found at '\{pretrained_path\}'")\
-        return\
-\
-    checkpoint = torch.load(pretrained_path, map_location='cpu', weights_only=True) # \uc0\u431 u ti\'ean True cho pretrained\
-\
-    if 'model' in checkpoint:\
-        state_dict = checkpoint['model']\
-    elif 'state_dict' in checkpoint:\
-        state_dict = checkpoint['state_dict']\
-    else:\
-        state_dict = checkpoint # Gi\uc0\u7843  s\u7917  file ch\u7881  ch\u7913 a state_dict\
-\
-    # X\uc0\u7917  l\'fd prefix 'module.'\
-    if all(k.startswith('module.') for k in state_dict.keys()):\
-        logger.info("Removing 'module.' prefix from pretrained DDP weights.")\
-        state_dict = \{k.replace('module.', ''): v for k, v in state_dict.items()\}\
-    \
-    # X\uc0\u7917  l\'fd num_classes mismatch cho fine-tuning\
-    if config and hasattr(config.MODEL, 'NUM_CLASSES'):\
-        current_num_classes = config.MODEL.NUM_CLASSES\
-        head_key_weight = 'head.weight' # Ho\uc0\u7863 c t\'ean kh\'e1c t\'f9y model\
-        head_key_bias = 'head.bias'\
-\
-        if head_key_weight in state_dict:\
-            ckpt_num_classes = state_dict[head_key_weight].shape[0]\
-            if ckpt_num_classes != current_num_classes:\
-                logger.warning(f"PRETRAINED: Num classes mismatch. Checkpoint head has \{ckpt_num_classes\} classes, "\
-                               f"current model requires \{current_num_classes\}. Removing head weights from pretrained.")\
-                keys_to_remove = [k for k in state_dict if k.startswith('head.')]\
-                for k_remove in keys_to_remove:\
-                    del state_dict[k_remove]\
-    \
-    msg = model.load_state_dict(state_dict, strict=False)\
-    logger.info(f"Pretrained weights loaded. Missing keys: \{msg.missing_keys\}. Unexpected keys: \{msg.unexpected_keys\}")\
-    del checkpoint\
-    torch.cuda.empty_cache()\
-\
-\
-# --- H\'c0M load_checkpoint \uc0\u272 \'c3 \u272 \u431 \u7906 C S\u7916 A ---\
-def load_checkpoint(config, model, optimizer, lr_scheduler, logger):\
-    start_epoch_from_ckpt = 0 # M\uc0\u7863 c \u273 \u7883 nh n\u7871 u kh\'f4ng c\'f3 'epoch' trong ckpt\
-    max_accuracy_from_ckpt = 0.0 # M\uc0\u7863 c \u273 \u7883 nh\
-\
-    if not config.MODEL.RESUME or config.MODEL.RESUME == '': # Ki\uc0\u7875 m tra ngay t\u7915  \u273 \u7847 u\
-        logger.info("No resume path specified in config.MODEL.RESUME. Skipping checkpoint loading.")\
-        return max_accuracy_from_ckpt, start_epoch_from_ckpt\
-\
-    logger.info(f"==============> Resuming training from checkpoint: \{config.MODEL.RESUME\}")\
-    if not os.path.isfile(config.MODEL.RESUME):\
-        logger.error(f"=> No checkpoint found at '\{config.MODEL.RESUME\}'")\
-        return max_accuracy_from_ckpt, start_epoch_from_ckpt\
-\
-    try:\
-        # *** S\uc0\u7916  D\u7908 NG weights_only=False V\'cc CHECKPOINT N\'c0Y L\'c0 DO B\u7840 N T\u7840 O RA V\'c0 C\'d3 TH\u7874  CH\u7912 A config.dump() (l\'e0 str) ho\u7863 c CfgNode (n\u7871 u l\u432 u c\u361 ) ***\
-        logger.info(f"Attempting to load checkpoint with weights_only=False from: \{config.MODEL.RESUME\}")\
-        checkpoint = torch.load(config.MODEL.RESUME, map_location='cpu', weights_only=False)\
-        logger.info("Successfully loaded checkpoint file with weights_only=False.")\
-    except Exception as e:\
-        logger.error(f"Failed to load checkpoint (path: \{config.MODEL.RESUME\}) with weights_only=False: \{e\}")\
-        logger.error("The checkpoint file might be corrupted or not a valid PyTorch checkpoint.")\
-        return max_accuracy_from_ckpt, start_epoch_from_ckpt\
-\
-\
-    if 'model' not in checkpoint:\
-        logger.error("No 'model' key found in checkpoint. Cannot resume model weights.")\
-        return max_accuracy_from_ckpt, start_epoch_from_ckpt\
-        \
-    # Load model state\
-    state_dict = checkpoint['model']\
-    # X\uc0\u7917  l\'fd prefix 'module.' n\u7871 u checkpoint \u273 \u432 \u7907 c l\u432 u t\u7915  DDP v\'e0 model hi\u7879 n t\u7841 i kh\'f4ng ph\u7843 i DDP\
-    is_current_model_ddp = isinstance(model, nn.parallel.DistributedDataParallel)\
-    is_ckpt_ddp = all(k.startswith('module.') for k in state_dict.keys())\
-\
-    if is_ckpt_ddp and not is_current_model_ddp:\
-        logger.info("Removing 'module.' prefix from DDP checkpoint for single GPU/CPU model.")\
-        state_dict = \{k.replace('module.', ''): v for k, v in state_dict.items()\}\
-    elif not is_ckpt_ddp and is_current_model_ddp:\
-        logger.info("Adding 'module.' prefix to load single GPU checkpoint into DDP model.")\
-        state_dict = \{'module.' + k: v for k, v in state_dict.items()\}\
-    \
-    # X\uc0\u7917  l\'fd NUM_CLASSES mismatch tr\u432 \u7899 c khi load (quan tr\u7885 ng cho fine-tuning)\
-    num_classes_ckpt = 0\
-    # Gi\uc0\u7843  s\u7917  head l\'e0 'head.weight' ho\u7863 c 'fc.weight' ho\u7863 c 'classifier.weight'\
-    head_keys_to_check = ['head.weight', 'fc.weight', 'classifier.weight', 'classif.weight'] # M\uc0\u7903  r\u7897 ng c\'e1c key c\'f3 th\u7875 \
-    actual_head_weight_key = None\
-    for h_key in head_keys_to_check:\
-        if h_key in state_dict:\
-            actual_head_weight_key = h_key\
-            break\
-            \
-    if actual_head_weight_key:\
-        num_classes_ckpt = state_dict[actual_head_weight_key].shape[0]\
-        if config.MODEL.NUM_CLASSES != num_classes_ckpt:\
-            logger.warning(f"NUM_CLASSES MISMATCH: Checkpoint head (\{actual_head_weight_key\}) has \{num_classes_ckpt\} classes, "\
-                           f"but current config.MODEL.NUM_CLASSES is \{config.MODEL.NUM_CLASSES\}.")\
-            logger.warning("NOT loading weights for the classification head from checkpoint.")\
-            # Lo\uc0\u7841 i b\u7887  c\'e1c key c\u7911 a head (v\'ed d\u7909 : head.weight, head.bias)\
-            keys_to_remove = [k for k in state_dict if k.startswith(actual_head_weight_key.split('.')[0] + '.')]\
-            for k_remove in keys_to_remove:\
-                del state_dict[k_remove]\
-                logger.info(f"Removed key \{k_remove\} from checkpoint state_dict.")\
-    else:\
-        logger.warning("Could not find a recognizable classification head in checkpoint to check NUM_CLASSES.")\
-\
-    msg = model.load_state_dict(state_dict, strict=False)\
-    logger.info(f"Model state_dict loaded. Missing keys: \{msg.missing_keys\}. Unexpected keys: \{msg.unexpected_keys\}")\
-\
-    # Load optimizer, scheduler, epoch, max_accuracy (ch\uc0\u7881  khi kh\'f4ng ph\u7843 i EVAL_MODE)\
-    if not config.EVAL_MODE:\
-        if 'optimizer' in checkpoint and optimizer is not None:\
-            try:\
-                optimizer.load_state_dict(checkpoint['optimizer'])\
-                logger.info("Optimizer state_dict loaded.")\
-            except Exception as e:\
-                logger.warning(f"Could not load optimizer state_dict: \{e\}. Optimizer will start from scratch.")\
-        else:\
-            logger.warning("No 'optimizer' in checkpoint or optimizer is None. Optimizer starts from scratch.")\
-\
-        if 'lr_scheduler' in checkpoint and lr_scheduler is not None:\
-            try:\
-                lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])\
-                logger.info("LR scheduler state_dict loaded.")\
-            except Exception as e:\
-                logger.warning(f"Could not load lr_scheduler state_dict: \{e\}. LR scheduler starts from scratch.")\
-        else:\
-            logger.warning("No 'lr_scheduler' in checkpoint or lr_scheduler is None. LR scheduler starts from scratch.")\
-        \
-        if 'epoch' in checkpoint:\
-            # checkpoint['epoch'] l\'e0 epoch V\uc0\u7914 A HO\'c0N TH\'c0NH\
-            start_epoch_from_ckpt = checkpoint['epoch'] # S\uc0\u7869  \u273 \u432 \u7907 c +1 trong main.py cho v\'f2ng l\u7863 p\
-            config.defrost()\
-            config.TRAIN.START_EPOCH = checkpoint['epoch'] # L\uc0\u432 u epoch \u273 \'e3 ho\'e0n th\'e0nh\
-            config.freeze()\
-            logger.info(f"Training will resume from NEXT epoch: \{start_epoch_from_ckpt + 1\}")\
-        else:\
-            logger.warning("No 'epoch' key in checkpoint. Training will start from epoch defined in config (or 0).")\
-        \
-        if 'max_accuracy' in checkpoint:\
-            max_accuracy_from_ckpt = checkpoint['max_accuracy']\
-            logger.info(f"Resuming with max_accuracy from checkpoint: \{max_accuracy_from_ckpt:.2f\}%")\
-\
-    elif 'max_accuracy' in checkpoint:\
-        max_accuracy_from_ckpt = checkpoint['max_accuracy']\
-        logger.info(f"Checkpoint max_accuracy (EVAL_MODE): \{max_accuracy_from_ckpt:.2f\}%")\
-\
-    logger.info(f"=> Checkpoint '\{config.MODEL.RESUME\}' (saved at end of epoch \{checkpoint.get('epoch', 'N/A')\}) loaded successfully.")\
-    \
-    del checkpoint\
-    if torch.cuda.is_available() and config.LOCAL_RANK != -1:\
-        torch.cuda.empty_cache()\
-        \
-    return max_accuracy_from_ckpt, config.TRAIN.START_EPOCH # Tr\uc0\u7843  v\u7873  START_EPOCH t\u7915  config (\u273 \'e3 \u273 \u432 \u7907 c c\u7853 p nh\u7853 t)\
-\
-\
-def save_checkpoint_new(config, epoch_completed, model, current_acc, optimizer, lr_scheduler, logger, name=None):\
-    """Saves checkpoint.\
-    Args:\
-        epoch_completed: The epoch number that has just been completed.\
-        current_acc: Accuracy of the model at this epoch (e.g., validation acc)\
-    """\
-    save_state = \{\
-        'model': model.state_dict(),\
-        'optimizer': optimizer.state_dict(),\
-        'lr_scheduler': lr_scheduler.state_dict(),\
-        'max_accuracy': config.MODEL.MAX_ACCURACY if hasattr(config.MODEL, 'MAX_ACCURACY') else current_acc, # L\uc0\u432 u max_accuracy t\u7893 ng th\u7875 \
-        'current_accuracy_this_ckpt': current_acc, # L\uc0\u432 u acc c\u7911 a ckpt n\'e0y\
-        'epoch': epoch_completed, # L\uc0\u432 u epoch V\u7914 A HO\'c0N TH\'c0NH\
-        'config_dump': config.dump() # L\uc0\u432 u config d\u432 \u7899 i d\u7841 ng text \u273 \u7875  tham kh\u7843 o\
-    \}\
-    if name is None:\
-        save_path = os.path.join(config.OUTPUT, f'ckpt_epoch_\{epoch_completed\}.pth')\
-    else:\
-        save_path = os.path.join(config.OUTPUT, f'\{name\}.pth')\
-    \
-    logger.info(f"Saving checkpoint to \{save_path\} (epoch \{epoch_completed\} completed, current_acc \{current_acc:.2f\}%)")\
-    torch.save(save_state, save_path)\
-    logger.info(f"Checkpoint \{save_path\} saved successfully!")}
+import os
+import torch
+import torch.distributed as dist
+import pickle
+from yacs.config import CfgNode as CN # Cần cho isinstance nếu kiểm tra config trong checkpoint
+# from logger import create_logger # Không nên import create_logger ở đây, logger được truyền vào
+
+
+# THÊM LẠI HÀM REDUCE_TENSOR
+def reduce_tensor(tensor):
+    """
+    Reduces a tensor from all processes to rank 0 and averages it.
+    Assumes tensor is on the correct device.
+    """
+    if not dist.is_available() or not dist.is_initialized():
+        return tensor
+    rt = tensor.clone()
+    dist.all_reduce(rt, op=dist.ReduceOp.SUM)
+    rt /= dist.get_world_size()
+    return rt
+
+
+def load_pretrained(pretrained_path, model, logger):
+    logger.info(f"==============> Loading weight {pretrained_path} for fine-tuning......")
+    if not os.path.isfile(pretrained_path):
+        logger.error(f"Pretrained file not found at {pretrained_path}. Skipping load_pretrained.")
+        return
+
+    try:
+        checkpoint = torch.load(pretrained_path, map_location='cpu', weights_only=False) # Cho phép load object
+    except Exception as e:
+        logger.error(f"Failed to load pretrained file from {pretrained_path}: {e}")
+        return
+
+    state_dict_to_load = checkpoint.get('model', checkpoint.get('state_dict', checkpoint))
+    if not isinstance(state_dict_to_load, dict):
+        logger.error(f"Pretrained file {pretrained_path} does not contain a 'model' or 'state_dict' key, or it's not a dictionary.")
+        return
+
+    # Xử lý prefix 'module.'
+    new_sd = {}
+    has_module_prefix = all(k.startswith('module.') for k in state_dict_to_load.keys())
+    is_model_ddp = isinstance(model, torch.nn.parallel.DistributedDataParallel)
+
+    if has_module_prefix and not is_model_ddp: # Ckpt DDP, model non-DDP
+        logger.info("Pretrained checkpoint is from DDP, removing 'module.' prefix for non-DDP model.")
+        for k, v in state_dict_to_load.items():
+            new_sd[k[7:]] = v
+        state_dict_to_load = new_sd
+    elif not has_module_prefix and is_model_ddp: # Ckpt non-DDP, model DDP
+        logger.info("Pretrained checkpoint is non-DDP, adding 'module.' prefix for DDP model.")
+        for k, v in state_dict_to_load.items():
+            new_sd['module.' + k] = v
+        state_dict_to_load = new_sd
+    
+    model_dict = model.state_dict()
+    
+    # Chỉ giữ lại các key có trong model hiện tại và khớp kích thước
+    pretrained_dict_filtered = {
+        k: v for k, v in state_dict_to_load.items()
+        if k in model_dict and model_dict[k].shape == v.shape
+    }
+
+    loaded_keys = set(pretrained_dict_filtered.keys())
+    model_keys = set(model_dict.keys())
+    missing_in_model = loaded_keys - model_keys # Keys trong ckpt nhưng không có trong model (ít xảy ra nếu lọc đúng)
+    missing_in_ckpt = model_keys - loaded_keys  # Keys trong model nhưng không có trong ckpt (quan trọng, ví dụ head)
+
+    if len(pretrained_dict_filtered) == 0:
+        logger.warning("No weights were loaded from pretrained checkpoint after filtering. Check keys and shapes.")
+    
+    model_dict.update(pretrained_dict_filtered)
+    msg = model.load_state_dict(model_dict, strict=False)
+    
+    if msg.missing_keys: logger.warning(f"During load_pretrained, missing keys in model's state_dict: {msg.missing_keys}")
+    if msg.unexpected_keys: logger.warning(f"During load_pretrained, unexpected keys in checkpoint's state_dict: {msg.unexpected_keys}")
+    
+    # In ra các key không được load từ checkpoint do khác shape hoặc không tồn tại trong model
+    not_loaded_from_ckpt = set(state_dict_to_load.keys()) - loaded_keys
+    if not_loaded_from_ckpt:
+        logger.warning(f"Weights from checkpoint not loaded into model (due to name/shape mismatch or not in model): {sorted(list(not_loaded_from_ckpt))}")
+
+    # In ra các key của model không được cập nhật từ checkpoint
+    if missing_in_ckpt:
+        logger.warning(f"Model keys not found in (or not loaded from) pretrained checkpoint: {sorted(list(missing_in_ckpt))}")
+
+    logger.info(f"=> Successfully processed pretrained weights from '{pretrained_path}'")
+    del checkpoint, state_dict_to_load, pretrained_dict_filtered, model_dict
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def load_checkpoint(config, model, optimizer, lr_scheduler, logger): # 5 tham số
+    logger.info(f"==============> Resuming form {config.MODEL.RESUME}....................")
+    if not os.path.isfile(config.MODEL.RESUME):
+        logger.error(f"Checkpoint file not found at '{config.MODEL.RESUME}'. Cannot resume.")
+        return 0.0, config.TRAIN.START_EPOCH # Trả về max_acc và start_epoch hiện tại
+
+    logger.info(f"Attempting to load checkpoint with weights_only=False. Path: {config.MODEL.RESUME}")
+    try:
+        checkpoint = torch.load(config.MODEL.RESUME, map_location='cpu', weights_only=False)
+        logger.info("Successfully loaded checkpoint file with weights_only=False.")
+    except pickle.UnpicklingError as e_pickle:
+        logger.error(f"Pickle UnpicklingError during torch.load for '{config.MODEL.RESUME}': {e_pickle}")
+        raise
+    except Exception as e:
+        logger.error(f"Failed to load checkpoint (path: {config.MODEL.RESUME}): {e}")
+        return 0.0, config.TRAIN.START_EPOCH
+
+    if 'model' not in checkpoint:
+        logger.error("'model' key not found in checkpoint. Cannot load model weights.")
+        return 0.0, config.TRAIN.START_EPOCH
+        
+    state_dict = checkpoint['model']
+    new_state_dict = {}
+    is_model_ddp = isinstance(model, torch.nn.parallel.DistributedDataParallel)
+    is_ckpt_ddp = all(k.startswith('module.') for k in state_dict.keys())
+
+    if is_ckpt_ddp and not is_model_ddp:
+        logger.info("Checkpoint is DDP, model is not. Removing 'module.' prefix.")
+        for k, v in state_dict.items(): new_state_dict[k[7:]] = v
+        model_sd_to_load = new_state_dict
+    elif not is_ckpt_ddp and is_model_ddp:
+        logger.info("Checkpoint is not DDP, model is DDP. Adding 'module.' prefix.")
+        for k, v in state_dict.items(): new_state_dict['module.' + k] = v
+        model_sd_to_load = new_state_dict
+    else:
+        model_sd_to_load = state_dict
+
+    load_strict = True
+    ckpt_num_classes = -1
+    # Xác định số lớp của head trong checkpoint một cách an toàn hơn
+    head_key_prefix = None
+    if 'head.weight' in model_sd_to_load: head_key_prefix = 'head.'
+    elif 'fc.weight' in model_sd_to_load: head_key_prefix = 'fc.'
+    # Thêm các prefix head khác nếu model có thể có (ví dụ 'classifier.')
+
+    if head_key_prefix and f'{head_key_prefix}weight' in model_sd_to_load:
+        ckpt_num_classes = model_sd_to_load[f'{head_key_prefix}weight'].shape[0]
+
+    if hasattr(config.MODEL, 'NUM_CLASSES') and ckpt_num_classes != -1 and config.MODEL.NUM_CLASSES != ckpt_num_classes:
+        logger.warning(f"NUM_CLASSES MISMATCH! Checkpoint head has {ckpt_num_classes} classes, "
+                       f"current config.MODEL.NUM_CLASSES is {config.MODEL.NUM_CLASSES}. "
+                       "Will load with strict=False and head weights will likely be skipped.")
+        keys_to_remove = [k for k in model_sd_to_load if head_key_prefix and k.startswith(head_key_prefix)]
+        if keys_to_remove:
+            logger.info(f"Removing head keys from checkpoint state_dict: {keys_to_remove}")
+            for k_rem in keys_to_remove: del model_sd_to_load[k_rem]
+        load_strict = False
+    
+    msg = model.load_state_dict(model_sd_to_load, strict=load_strict)
+    logger.info(f"Model state_dict loaded. Strict: {load_strict}. Message: {msg}")
+    if msg.missing_keys: logger.warning(f"Missing keys in model when loading checkpoint: {msg.missing_keys}")
+    if msg.unexpected_keys: logger.warning(f"Unexpected keys in checkpoint when loading model: {msg.unexpected_keys}")
+
+    max_accuracy = 0.0
+    start_epoch_from_ckpt = config.TRAIN.START_EPOCH # Giữ nguyên nếu không có trong checkpoint
+
+    if not config.EVAL_MODE:
+        if 'optimizer' in checkpoint and optimizer is not None:
+            try:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                logger.info("Optimizer state_dict loaded.")
+            except Exception as e: logger.warning(f"Could not load optimizer state_dict: {e}.")
+        else: logger.warning("Optimizer state_dict not found in checkpoint or optimizer is None.")
+
+        if 'lr_scheduler' in checkpoint and lr_scheduler is not None:
+            try:
+                lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+                logger.info("LR scheduler state_dict loaded.")
+            except Exception as e: logger.warning(f"Could not load LR scheduler state_dict: {e}.")
+        else: logger.warning("LR scheduler state_dict not found or lr_scheduler is None.")
+
+        if 'epoch' in checkpoint:
+            completed_epoch = checkpoint['epoch']
+            # Cập nhật config.TRAIN.START_EPOCH trực tiếp
+            config.defrost()
+            config.TRAIN.START_EPOCH = completed_epoch + 1
+            config.freeze()
+            start_epoch_from_ckpt = config.TRAIN.START_EPOCH
+            logger.info(f"Training will resume from epoch {start_epoch_from_ckpt} (completed epoch {completed_epoch}).")
+        else:
+            logger.warning(f"Epoch not found in checkpoint. Training will start from config.TRAIN.START_EPOCH (currently {config.TRAIN.START_EPOCH}).")
+            start_epoch_from_ckpt = config.TRAIN.START_EPOCH
+
+
+    if 'max_accuracy' in checkpoint:
+        max_accuracy = checkpoint['max_accuracy']
+        logger.info(f"Max accuracy loaded from checkpoint: {max_accuracy:.2f}%")
+    
+    logger.info(f"=> Loaded checkpoint '{config.MODEL.RESUME}' (saved at epoch {checkpoint.get('epoch', 'N/A')}) successfully.")
+    
+    del checkpoint
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
+    
+    # Hàm này trong main.py hiện tại gán giá trị trả về cho max_accuracy
+    # và không dùng start_epoch trả về. config.TRAIN.START_EPOCH đã được cập nhật.
+    return max_accuracy
+
+
+def save_checkpoint_new(config, epoch, model_without_ddp, acc1, optimizer, lr_scheduler, logger, name=None):
+    save_state = {
+        'model': model_without_ddp.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'lr_scheduler': lr_scheduler.state_dict(),
+        'max_accuracy': acc1, 
+        'epoch': epoch, # epoch vừa hoàn thành
+        'config_dump_str': config.dump() # Lưu config hiện tại dưới dạng chuỗi YAML
+    }
+
+    if name:
+        save_path = os.path.join(config.OUTPUT, f'{name}.pth')
+    else:
+        save_path = os.path.join(config.OUTPUT, f'ckpt_epoch_{epoch}.pth')
+
+    logger.info(f"{save_path} saving......")
+    torch.save(save_state, save_path)
+    logger.info(f"{save_path} saved !!!")
+
+
+def get_grad_norm(parameters, norm_type=2.0): # Đảm bảo norm_type là float
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
+    parameters = list(filter(lambda p: p.grad is not None, parameters))
+    if not parameters: # Nếu không có tham số nào có grad
+        return torch.tensor(0.) # Trả về tensor 0
+    norm_type = float(norm_type)
+    total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), norm_type) for p in parameters]), norm_type)
+    return total_norm.item()
+
+
+def auto_resume_helper(output_dir):
+    # Tạo logger tạm thời nếu cần, hoặc truyền logger vào
+    # print(f"Auto-resuming: Checking directory {output_dir}")
+    if not os.path.isdir(output_dir):
+        # print(f"Auto-resuming: Output directory {output_dir} does not exist. No checkpoint to resume.")
+        return None
+        
+    checkpoints = [f for f in os.listdir(output_dir) if f.endswith('pth') and f.startswith('ckpt_epoch_')]
+    # print(f"Auto-resuming: Found pth files: {checkpoints}")
+    if checkpoints:
+        # Sắp xếp theo số epoch (ví dụ: ckpt_epoch_10.pth > ckpt_epoch_9.pth)
+        checkpoints.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
+        latest_checkpoint = os.path.join(output_dir, checkpoints[-1])
+        # print(f"Auto-resuming: Latest checkpoint is {latest_checkpoint}")
+        return latest_checkpoint
+    # print(f"Auto-resuming: No checkpoint files starting with 'ckpt_epoch_' found in {output_dir}.")
+    return None
+
+# Các hàm khác nếu có trong utils.py của bạn...
